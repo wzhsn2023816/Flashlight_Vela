@@ -1,0 +1,10 @@
+<script>
+  export default {
+    onCreate() {
+      console.log('Flashlight app created')
+    },
+    onDestroy() {
+      console.log('Flashlight app destroyed')
+    }
+  }
+</script>
