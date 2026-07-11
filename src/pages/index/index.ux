@@ -1,0 +1,393 @@
+<template>
+  <div class="page">
+    <!-- 垂直滚动虚拟页面，滚动到底/顶时切换模式 -->
+    <scroll id="modeScroll" class="scroll"
+            scroll-y="true"
+            bounces="true"
+            onscroll="onScroll">
+      <div class="mode-page">
+        <div class="card mode-white"></div>
+      </div>
+      <div class="mode-page">
+        <div class="card mode-red"></div>
+      </div>
+      <div class="mode-page">
+        <div class="card mode-white {{flashClass}}"></div>
+      </div>
+    </scroll>
+
+    <!-- 模式指示点，固定在表冠位置 -->
+    <div class="dots">
+      <div class="dot {{dot0}}"></div>
+      <div class="dot {{dot1}}"></div>
+      <div class="dot {{dot2}}"></div>
+    </div>
+
+    <!-- 状态提示 -->
+    <text if="{{showHint}}" class="hint-text {{hintClass}}">{{hintText}}</text>
+  </div>
+</template>
+
+<script>
+import sensor from '@system.sensor'
+import brightness from '@system.brightness'
+
+const MODES = [
+  { name: 'white', class: 'mode-white' },
+  { name: 'red', class: 'mode-red' },
+  { name: 'flash', class: 'mode-white' }
+]
+
+const FLASH_INTERVAL = 500
+const ANGLE_FOLLOW_MIN = -17
+
+export default {
+  private: {
+    currentMode: 0,
+    flashClass: '',
+    dot0: 'dot-active',
+    dot1: '',
+    dot2: '',
+    hintClass: '',
+    showHint: false,
+    hintText: '',
+    pageHeight: 0,
+    flashTimer: null,
+    isFlipped: false,
+    originalBrightness: 128,
+    originalMode: 1,
+    hasBrightnessControl: true,
+    hintTimer: null
+  },
+
+  onInit() {
+    this.currentMode = 0
+    this.updateModeUI()
+    this.saveOriginalBrightness()
+    this.startSensor()
+  },
+
+  onReady() {
+    this.measurePageHeight()
+    this.setKeepScreenOn(true)
+    this.showModeHint()
+  },
+
+  onShow() {
+    this.measurePageHeight()
+    this.setKeepScreenOn(true)
+    this.startSensor()
+    this.updateFlashState()
+  },
+
+  onHide() {
+    this.stopSensor()
+    this.stopFlash()
+    this.restoreBrightness()
+    this.setKeepScreenOn(false)
+  },
+
+  onDestroy() {
+    this.stopSensor()
+    this.stopFlash()
+    this.restoreBrightness()
+    this.setKeepScreenOn(false)
+  },
+
+  measurePageHeight() {
+    const el = this.$element('modeScroll')
+    if (!el || !el.getScrollRect) return
+    el.getScrollRect({
+      success: (rect) => {
+        if (rect && rect.height) {
+          this.pageHeight = rect.height / MODES.length
+        }
+      }
+    })
+  },
+
+  saveOriginalBrightness() {
+    brightness.getValue({
+      success: (data) => {
+        this.originalBrightness = data.value || 128
+      }
+    })
+    brightness.getMode({
+      success: (data) => {
+        this.originalMode = data.mode !== undefined ? data.mode : 1
+      }
+    })
+  },
+
+  setKeepScreenOn(keep) {
+    brightness.setKeepScreenOn({
+      keepScreenOn: keep,
+      fail: () => {}
+    })
+  },
+
+  startSensor() {
+    if (!sensor.subscribeAccelerometer) {
+      this.hasBrightnessControl = false
+      return
+    }
+
+    sensor.subscribeAccelerometer({
+      interval: 'game',
+      callback: (ret) => {
+        this.handleAccelerometer(ret)
+      },
+      fail: (msg, code) => {
+        console.log('accelerometer fail:', msg, code)
+        this.hasBrightnessControl = false
+      }
+    })
+  },
+
+  stopSensor() {
+    if (sensor.unsubscribeAccelerometer) {
+      sensor.unsubscribeAccelerometer()
+    }
+  },
+
+  handleAccelerometer(ret) {
+    if (!this.hasBrightnessControl) return
+    // 只有白光模式需要手腕翻转控制亮度
+    if (this.currentMode !== 0) return
+
+    const x = ret.x || 0
+    const z = ret.z || 0
+    const angle = -Math.atan2(x, -z) * 180 / Math.PI
+    const isOutward = angle < ANGLE_FOLLOW_MIN
+
+    if (isOutward && !this.isFlipped) {
+      this.isFlipped = true
+      this.setMaxBrightness()
+    } else if (!isOutward && this.isFlipped) {
+      this.isFlipped = false
+      this.restoreBrightness()
+    }
+  },
+
+  setMaxBrightness() {
+    brightness.setMode({
+      mode: 0,
+      fail: () => {}
+    })
+    brightness.setValue({
+      value: 255,
+      success: () => {
+        this.showHint('最高亮度')
+      },
+      fail: () => {}
+    })
+  },
+
+  restoreBrightness() {
+    brightness.setValue({
+      value: this.originalBrightness,
+      fail: () => {}
+    })
+    brightness.setMode({
+      mode: this.originalMode,
+      success: () => {
+        this.showHint('跟随系统')
+      },
+      fail: () => {}
+    })
+  },
+
+  onScroll(e) {
+    if (!this.pageHeight || this.pageHeight <= 0) return
+
+    const y = e.scrollY || 0
+    let index = Math.round(y / this.pageHeight)
+    if (index < 0) index = 0
+    if (index >= MODES.length) index = MODES.length - 1
+
+    if (index !== this.currentMode) {
+      this.currentMode = index
+      this.onModeChange()
+    }
+  },
+
+  onModeChange() {
+    this.updateModeUI()
+    this.updateFlashState()
+
+    // 白光模式使用手腕翻转控制亮度；红光和闪光模式直接最高亮度
+    if (this.currentMode === 0) {
+      if (this.isFlipped) {
+        this.setMaxBrightness()
+      } else {
+        this.restoreBrightness()
+      }
+    } else {
+      this.setMaxBrightness()
+    }
+
+    const modeNames = ['白光', '红光', '白光闪光']
+    this.showHint(modeNames[this.currentMode])
+  },
+
+  updateModeUI() {
+    this.hintClass = this.currentMode === 1 ? 'hint-text-red' : ''
+
+    // 每个模式使用不同的激活点样式；非激活点统一用默认 .dot 样式
+    const activeStyles = ['dot-white-active', 'dot-red-active', 'dot-flash-active']
+
+    for (let i = 0; i < 3; i++) {
+      const isActive = i === this.currentMode
+      const className = isActive ? activeStyles[i] : ''
+      if (i === 0) this.dot0 = className
+      else if (i === 1) this.dot1 = className
+      else this.dot2 = className
+    }
+  },
+
+  updateFlashState() {
+    this.stopFlash()
+    if (this.currentMode === 2) {
+      this.startFlash()
+    } else {
+      this.flashClass = ''
+    }
+  },
+
+  startFlash() {
+    let on = false
+    this.flashTimer = setInterval(() => {
+      on = !on
+      this.flashClass = on ? '' : 'flash-off'
+    }, FLASH_INTERVAL)
+  },
+
+  stopFlash() {
+    if (this.flashTimer) {
+      clearInterval(this.flashTimer)
+      this.flashTimer = null
+    }
+    this.flashClass = ''
+  },
+
+  showModeHint() {
+    this.showHint('白光')
+  },
+
+  showHint(text) {
+    this.hintText = text
+    this.showHint = true
+    if (this.hintTimer) {
+      clearTimeout(this.hintTimer)
+    }
+    this.hintTimer = setTimeout(() => {
+      this.showHint = false
+    }, 1200)
+  }
+}
+</script>
+
+<style>
+.page {
+  width: 100%;
+  height: 100%;
+  background-color: #000000;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+
+.scroll {
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  scroll-snap-type: y mandatory;
+}
+
+.mode-page {
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+.card {
+  width: 100%;
+  height: 100%;
+  border-radius: 110px;
+}
+
+.mode-white {
+  background-color: #FFFFFF;
+}
+
+.mode-red {
+  background-color: #FF0000;
+}
+
+.flash-off {
+  background-color: #000000;
+}
+
+.dots {
+  position: absolute;
+  right: 4px;
+  top: 70%;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  width: 32px;
+}
+
+/* 所有非激活点统一使用深灰色带透明度，在任何背景下都可见 */
+.dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  background-color: rgba(80, 80, 80, 0.6);
+  margin-top: 10px;
+  margin-bottom: 10px;
+}
+
+/* 白光激活点：黑色 */
+.dot-white-active {
+  background-color: rgba(0, 0, 0, 0.85);
+  width: 20px;
+  height: 20px;
+  border-radius: 10px;
+}
+
+/* 红光激活点：白色 */
+.dot-red-active {
+  background-color: rgba(255, 255, 255, 0.95);
+  width: 20px;
+  height: 20px;
+  border-radius: 10px;
+}
+
+/* 闪光激活点：深灰色，在白光和黑光切换时都能看到 */
+.dot-flash-active {
+  background-color: rgba(60, 60, 60, 0.9);
+  width: 20px;
+  height: 20px;
+  border-radius: 10px;
+}
+
+.hint-text {
+  position: absolute;
+  top: 80px;
+  font-size: 24px;
+  color: #666666;
+  background-color: rgba(255, 255, 255, 0.8);
+  padding: 8px 16px;
+  border-radius: 20px;
+}
+
+.hint-text-red {
+  color: #FFFFFF;
+  background-color: rgba(0, 0, 0, 0.5);
+}
+</style>
